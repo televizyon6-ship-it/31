@@ -1,11 +1,11 @@
 local TweenService = game:GetService("TweenService")
 local LocalPlayer = game.Players.LocalPlayer
 
--- Queue this script to auto-execute on teleport/server change
+-- Auto-execute on teleport/server change (same pattern as Infinite Yield)
 local SCRIPT_URL = "https://raw.githubusercontent.com/televizyon6-ship-it/31/refs/heads/main/ww"
-local queueFunc = queue_on_teleport or queueonteleport
-if queueFunc then
-    queueFunc('loadstring(game:HttpGet("' .. SCRIPT_URL .. '"))()')
+local queueteleport = queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
+if type(queueteleport) == "function" then
+    pcall(queueteleport, 'loadstring(game:HttpGet("' .. SCRIPT_URL .. '"))()')
     print("[ToH] Script queued for next server!")
 end
 
