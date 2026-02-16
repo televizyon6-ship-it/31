@@ -1,3 +1,7 @@
+-- Prevent double execution (autoexec + queue_on_teleport)
+if TOH_LOADED then return end
+pcall(function() getgenv().TOH_LOADED = true end)
+
 local TweenService = game:GetService("TweenService")
 local LocalPlayer = game.Players.LocalPlayer
 
