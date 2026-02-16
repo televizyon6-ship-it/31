@@ -2,11 +2,10 @@ local TweenService = game:GetService("TweenService")
 local LocalPlayer = game.Players.LocalPlayer
 
 -- Queue this script to auto-execute on teleport/server change
+local SCRIPT_URL = "https://raw.githubusercontent.com/televizyon6-ship-it/31/refs/heads/main/ww"
 local queueFunc = queue_on_teleport or queueonteleport
 if queueFunc then
-    pcall(function()
-        queueFunc(loadstring and 'loadfile("autoexec/toh.lua")()' or 'dofile("autoexec/toh.lua")')
-    end)
+    queueFunc('loadstring(game:HttpGet("' .. SCRIPT_URL .. '"))()')
     print("[ToH] Script queued for next server!")
 end
 
