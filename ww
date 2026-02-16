@@ -71,7 +71,10 @@ local function GetWhitelistedParts(whitelister)
     
     for _, part in pairs(parts) do
         if part:IsA("BasePart") then
-            whitelist[part] = true
+            -- Ignore invisible parts and parts with no collision
+            if part.Transparency < 1 and part.CanCollide then
+                whitelist[part] = true
+            end
         end
     end
     
