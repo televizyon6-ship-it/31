@@ -16,7 +16,7 @@ end
 
 local function Tween(Object, Destination, TimeOveride, shouldWait)
     local Distance = (Object.Position - Destination).Magnitude
-    local Time = Distance / (LocalPlayer.Character.Humanoid.WalkSpeed * 2.5)
+    local Time = Distance / (LocalPlayer.Character.Humanoid.WalkSpeed * 2.25)
     if TimeOveride ~= nil then
         Time = TimeOveride
     end
