@@ -1,12 +1,26 @@
-wait(1)
 -- Prevent double execution (autoexec + queue_on_teleport)
-if TOH_LOADED then return end
+if getgenv().TOH_LOADED then return end
 pcall(function() getgenv().TOH_LOADED = true end)
 
 local TweenService = game:GetService("TweenService")
-local LocalPlayer = game.Players.LocalPlayer
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TeleportService = game:GetService("TeleportService")
+local VirtualUser = game:GetService("VirtualUser")
 
--- Auto-execute on teleport/server change (same pattern as Infinite Yield)
+local LocalPlayer = Players.LocalPlayer
+local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local Humanoid = Character:WaitForChild("Humanoid")
+local RootPart = Character:WaitForChild("HumanoidRootPart")
+
+-- Update Character references on respawn
+LocalPlayer.CharacterAdded:Connect(function(char)
+    Character = char
+    Humanoid = char:WaitForChild("Humanoid")
+    RootPart = char:WaitForChild("HumanoidRootPart")
+end)
+
+-- Auto-execute on teleport logic (Preserved)
 local SCRIPT_URL = "https://raw.githubusercontent.com/televizyon6-ship-it/31/refs/heads/main/ww"
 local queueteleport = queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
 if type(queueteleport) == "function" then
@@ -14,282 +28,261 @@ if type(queueteleport) == "function" then
     print("[ToH] Script queued for next server!")
 end
 
-local function Tween(Object, Destination, TimeOveride, shouldWait)
-    local Distance = (Object.Position - Destination).Magnitude
-    local Time = Distance / (LocalPlayer.Character.Humanoid.WalkSpeed * 2.25)
-    if TimeOveride ~= nil then
-        Time = TimeOveride
-    end
-    local Tw = TweenService:Create(Object, TweenInfo.new(Time, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut,0,false,0), 
-    {CFrame = CFrame.new(Destination)})
-    Tw:Play()
-    
-    local finished = false
-    local finish = Tw.Completed:Connect(function()
-        finished = true
-        Tw:Destroy()
-    end)
-    
-    repeat
-        wait()
-        Object.Velocity = Vector3.zero
-    until finished == true
-    finish:Disconnect()
-    Object.Velocity = Vector3.new(0, 50, 0)
-    
-    -- Only wait 0.5 seconds if shouldWait is true (for start/stop waypoints)
-    if shouldWait then
-        task.wait(0.5)
-    end
-end
-
--- Function to create whitelister part
-local function CreateWhitelister()
-    local whitelister = Instance.new("Part")
-    whitelister.Name = "Whitelister"
-    whitelister.Position = Vector3.new(0, 300, 0)
-    whitelister.Size = Vector3.new(35, 555, 35)
-    whitelister.Transparency = 0.6
-    whitelister.Anchored = true
-    whitelister.CanCollide = false
-    whitelister.Color = Color3.fromRGB(255, 255, 0)
-    whitelister.Material = Enum.Material.Neon
-    whitelister.Parent = workspace
-    return whitelister
-end
-
--- Function to get whitelisted parts using overlap detection
-local function GetWhitelistedParts(whitelister)
-    local whitelist = {}
-    local position = whitelister.Position
-    local size = whitelister.Size
-    
-    local overlapParams = OverlapParams.new()
-    overlapParams.FilterType = Enum.RaycastFilterType.Blacklist
-    overlapParams.FilterDescendantsInstances = {whitelister, LocalPlayer.Character}
-    
-    local parts = workspace:GetPartBoundsInBox(CFrame.new(position), size, overlapParams)
-    
-    for _, part in pairs(parts) do
-        if part:IsA("BasePart") then
-            -- Ignore invisible parts and parts with no collision
-            if part.Transparency < 1 and part.CanCollide then
-                whitelist[part] = true
-            end
-        end
-    end
-    
-    return whitelist
-end
-
--- Function to get random part from section (only from whitelisted parts)
-local function GetRandomPartFromSection(section, startPos, stopPos, whitelist)
-    local parts = {}
-    
-    for _, descendant in pairs(section:GetDescendants()) do
-        if descendant:IsA("BasePart") and descendant.Name ~= "start" and descendant.Name ~= "stop" then
-            if whitelist[descendant] then
-                if startPos and stopPos then
-                    local midY = (startPos.Y + stopPos.Y) / 2
-                    local partY = descendant.Position.Y
-                    if math.abs(partY - midY) < 20 then
-                        table.insert(parts, descendant)
-                    end
-                else
-                    table.insert(parts, descendant)
-                end
-            end
-        end
-    end
-    
-    if #parts == 0 then
-        for _, descendant in pairs(section:GetDescendants()) do
-            if descendant:IsA("BasePart") and descendant.Name ~= "start" and descendant.Name ~= "stop" and whitelist[descendant] then
-                table.insert(parts, descendant)
-            end
-        end
-    end
-    
-    if #parts > 0 then
-        return parts[math.random(1, #parts)]
-    end
-    return nil
-end
-
-getsenv(game:GetService("Players").LocalPlayer.PlayerScripts:WaitForChild("LocalScript")).kick = function()
-    return;
-end
-
-local virtualUser = game:GetService("VirtualUser")
+-- Anti-AFK
 LocalPlayer.Idled:Connect(function()
-    virtualUser:CaptureController()
-    virtualUser:ClickButton2(Vector2.new())
+    VirtualUser:CaptureController()
+    VirtualUser:ClickButton2(Vector2.new())
 end)
 
-while wait(2) do
-    local success, error = pcall(function()
-        local Tower = workspace:WaitForChild("tower")
-        local Sections = Tower.sections
-        print("Started")
-        local RootPart = LocalPlayer.Character.HumanoidRootPart
-        
-        -- Clean up old whitelister if exists
-        local oldWhitelister = workspace:FindFirstChild("Whitelister")
-        if oldWhitelister then
-            oldWhitelister:Destroy()
-            print("Removed old whitelister")
+--------------------------------------------------------------------------------
+-- Configuration
+--------------------------------------------------------------------------------
+local Config = {
+    TweenSpeed = 35, -- Studs per second (slower is safer)
+    UseRandomPath = true, -- Randomly visit parts instead of direct line
+    LandOnParts = true, -- Stop tween to simulate landing (anti-float)
+    MaxJumpDistance = 45, -- Max distance to tween between parts
+    VerticalScanRange = 100, -- Vertical distance to look for next part
+}
+
+--------------------------------------------------------------------------------
+-- Helper Functions
+--------------------------------------------------------------------------------
+
+-- Custom "Wait" compatible with task scheduler
+local function safeWait(t)
+    local start = tick()
+    repeat RunService.Heartbeat:Wait() until tick() - start >= (t or 0)
+end
+
+-- Check if a part is safe to land on
+local function isSafePart(part)
+    if not part:IsA("BasePart") then return false end
+    if not part.CanCollide then return false end
+    if part.Transparency >= 1 then return false end
+    if part.Name:lower() == "kills" or part.Name:lower():find("kill") then return false end
+    -- Check for neon red (often kill parts) - simple heuristic
+    if part.Material == Enum.Material.Neon and part.Color.R > 0.9 and part.Color.G < 0.1 then return false end
+    return true
+end
+
+-- Get all safe parts in a section, sorted by height
+local function getSafePartsInSection(section)
+    local parts = {}
+    for _, child in ipairs(section:GetDescendants()) do
+        if isSafePart(child) then
+            table.insert(parts, child)
+        end
+    end
+    -- Sort by Y level (ascending)
+    table.sort(parts, function(a, b)
+        return a.Position.Y < b.Position.Y
+    end)
+    return parts
+end
+
+-- Tween function with callbacks and anti-cheat measures
+local function Tween(targetCFrame, speedOverride)
+    if not RootPart then return end
+    
+    local distance = (RootPart.Position - targetCFrame.Position).Magnitude
+    local speed = speedOverride or Config.TweenSpeed
+    local time = distance / speed
+    
+    -- Easing Style: Sine for smoother start/stop
+    local tweenInfo = TweenInfo.new(
+        time,
+        Enum.EasingStyle.Sine,
+        Enum.EasingDirection.InOut
+    )
+    
+    local goal = {CFrame = targetCFrame}
+    
+    -- 1. Disable Physics (temporarily anchor) to prevent weird fling
+    -- RootPart.Anchored = true 
+    -- Actually, forcing velocity to 0 is better for "float" checks sometimes?
+    -- But anchoring is safer for exact positioning.
+    -- Let's stick to BodyVelocity or just standard Tween which ignores physics if anchored.
+    -- Better: Set velocity to 0 constantly.
+    
+    local bv = Instance.new("BodyVelocity")
+    bv.Velocity = Vector3.zero
+    bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+    bv.Parent = RootPart
+    
+    local tween = TweenService:Create(RootPart, tweenInfo, goal)
+    tween:Play()
+    
+    -- Wait for tween to complete
+    tween.Completed:Wait()
+    
+    -- Cleanup
+    if bv then bv:Destroy() end
+    
+    -- Anti-Float / Landing Logic
+    if Config.LandOnParts then
+        -- We are at the target. 
+        -- Stop everything.
+        -- Wait a split second to register "standing".
+        -- Since we tweened to (Part + 3 studs), we might be in air.
+        -- Drop down?
+        -- For safety, we just wait a tiny bit.
+        safeWait(0.1)
+    end
+end
+
+--------------------------------------------------------------------------------
+-- Main Logic
+--------------------------------------------------------------------------------
+local function RunScript()
+    local Tower = workspace:WaitForChild("tower", 10)
+    if not Tower then warn("Tower not found!") return end
+    
+    local Sections = Tower:WaitForChild("sections", 10)
+    if not Sections then warn("Sections not found!") return end
+
+    print("[ToH] Starting run...")
+    
+    -- Disable collision for player character to avoid getting stuck
+    for _, v in pairs(Character:GetChildren()) do
+        if v:IsA("BasePart") then v.CanCollide = false end
+    end
+    
+    -- Get Sorted Sections
+    local sectionList = {}
+    for _, section in pairs(Sections:GetChildren()) do
+        local startPart = section:FindFirstChild("start")
+        local stopPart = section:FindFirstChild("stop")
+        -- Fallback: Use bounding box center if start/stop missing
+        local yPos = 0
+        if startPart then yPos = startPart.Position.Y 
+        elseif stopPart then yPos = stopPart.Position.Y 
+        else
+            -- Check average of children?
+            local parts = getSafePartsInSection(section)
+            if #parts > 0 then yPos = parts[1].Position.Y end
         end
         
-        -- Create whitelister part
-        local whitelister = CreateWhitelister()
-        print("Whitelister created at position " .. tostring(whitelister.Position))
+        table.insert(sectionList, {
+            Instance = section,
+            Y = yPos,
+            Start = startPart,
+            Stop = stopPart
+        })
+    end
+    
+    table.sort(sectionList, function(a, b) return a.Y < b.Y end)
+    
+    -- Traverse Sections
+    for i, sectionData in ipairs(sectionList) do
+        print("[ToH] Entering Section " .. sectionData.Instance.Name)
         
-        -- Wait a moment for tower to load
-        task.wait(0.5)
+        local parts = getSafePartsInSection(sectionData.Instance)
         
-        -- Get whitelisted parts
-        local whitelist = GetWhitelistedParts(whitelister)
-        local whitelistCount = 0
-        for _ in pairs(whitelist) do whitelistCount = whitelistCount + 1 end
-        print("Whitelisted " .. whitelistCount .. " parts")
+        -- Strategy:
+        -- 1. Go to Start (if exists)
+        -- 2. "Hop" through safe parts up to Stop
+        -- 3. Go to Stop (if exists)
         
-        -- Store reference to FinishGlow to detect tower resets
-        local FinishGlow = Sections.finish:FindFirstChild("FinishGlow")
-        if not FinishGlow then
-            warn("FinishGlow not found, waiting for new tower...")
-            if whitelister then whitelister:Destroy() end
-            return
+        if sectionData.Start then
+            Tween(sectionData.Start.CFrame + Vector3.new(0, 3.5, 0))
         end
         
-        -- Disable collision
-        for i,v in pairs(LocalPlayer.Character:GetChildren()) do
-            if v:IsA("BasePart") then
-                v.CanTouch = false
-            end
-        end
+        -- Pathfinding through parts
+        local currentY = RootPart.Position.Y
+        local targetY = sectionData.Stop and sectionData.Stop.Position.Y or (parts[#parts] and parts[#parts].Position.Y or currentY + 50)
         
-        -- Collect sections with start and stop
-        local SectionList = {}
-        
-        for _, Section in pairs(Sections:GetChildren()) do
-            local hasStart = Section:FindFirstChild("start")
-            local hasStop = Section:FindFirstChild("stop")
-            
-            if hasStart or hasStop then
-                table.insert(SectionList, {
-                    Section = Section,
-                    StartPos = hasStart and Section.start.Position or nil,
-                    StopPos = hasStop and Section.stop.Position or nil,
-                    Name = Section.Name,
-                    HasStart = hasStart,
-                    HasStop = hasStop
-                })
-            end
-        end
-        
-        -- Sort sections by height (use start or stop position)
-        table.sort(SectionList, function(a, b)
-            local aY = a.StartPos and a.StartPos.Y or (a.StopPos and a.StopPos.Y or 0)
-            local bY = b.StartPos and b.StartPos.Y or (b.StopPos and b.StopPos.Y or 0)
-            return aY < bY
-        end)
-        
-        print("Total sections: " .. #SectionList)
-        
-        -- Tween through each section
-        for i, sectionData in ipairs(SectionList) do
-            -- Check if tower has reset
-            if not FinishGlow or not FinishGlow.Parent then
-                warn("Tower reset detected! Restarting script...")
-                if whitelister then whitelister:Destroy() end
-                return
-            end
-            
-            print("=== Section " .. i .. "/" .. #SectionList .. ": " .. sectionData.Name .. " ===")
-            
-            -- Tween to start if exists
-            if sectionData.HasStart then
-                print("  -> Going to START")
-                Tween(RootPart, sectionData.StartPos + Vector3.new(0, 3, 0), nil, true)
-            end
-            
-            -- 95% chance to tween to random part in section (only if has both start and stop)
-            if sectionData.HasStart and sectionData.HasStop and math.random() < 0.95 then
-                local randomPart = GetRandomPartFromSection(sectionData.Section, sectionData.StartPos, sectionData.StopPos, whitelist)
-                if randomPart then
-                    print("  -> Going to RANDOM PART: " .. randomPart.Name .. " (natural movement)")
-                    Tween(RootPart, randomPart.Position + Vector3.new(0, 3, 0), nil, false)
+        -- If we have parts, use them to climb
+        if #parts > 0 then
+            -- Initial filter: Only parts *above* us
+            local pathNodes = {}
+            for _, p in ipairs(parts) do
+                if p.Position.Y > currentY and p.Position.Y <= targetY then
+                     table.insert(pathNodes, p)
                 end
             end
             
-            -- Tween to stop if exists
-            if sectionData.HasStop then
-                print("  -> Going to STOP")
-                Tween(RootPart, sectionData.StopPos + Vector3.new(0, 3, 0), nil, true)
+            -- Visit a subset of these nodes to look natural
+            -- We don't need to visit EVERY part, just enough to not fly 200 studs at once
+            local lastNodePos = RootPart.Position
+            for _, node in ipairs(pathNodes) do
+                local dist = (node.Position - lastNodePos).Magnitude
+                -- Only move if it's a significant jump but not HUGE. 
+                -- Or if it bridges the gap.
+                -- Heuristic: If distance > 10 and distance < MaxJumpDistance
+                if dist > 5 and dist < Config.MaxJumpDistance then
+                    -- 50% chance to skip if we can just jump to next one?
+                    -- Actually, visiting more is safer against anti-float.
+                    Tween(node.CFrame + Vector3.new(0, 3.5, 0))
+                    lastNodePos = node.Position
+                elseif dist >= Config.MaxJumpDistance then
+                    -- If gap is too big, we MUST visit this node to bridge it
+                    Tween(node.CFrame + Vector3.new(0, 3.5, 0))
+                    lastNodePos = node.Position
+                end
             end
         end
         
-        print("Completed all sections!")
-        
-        -- Re-enable collision at finish
-        for i,v in pairs(LocalPlayer.Character:GetChildren()) do
-            if v:IsA("BasePart") then
-                v.CanTouch = true
+        if sectionData.Stop then
+            Tween(sectionData.Stop.CFrame + Vector3.new(0, 3.5, 0))
+        end
+    end
+    
+    -- Finish handling
+    local Finish = Sections:FindFirstChild("finish") 
+        or Sections.Parent:FindFirstChild("finish") -- checking tower root too
+    
+    if Finish then
+         local finishGlow = Finish:FindFirstChild("FinishGlow")
+         if finishGlow then
+            print("[ToH] Touching FinishGlow...")
+            -- Tween to finish and touch it
+            Tween(finishGlow.CFrame)
+            -- Simulate touch just in case
+            if firetouchinterest then
+                firetouchinterest(RootPart, finishGlow, 0)
+                firetouchinterest(RootPart, finishGlow, 1)
             end
-        end
-        
-        -- Finish sequence with error checking
-        if not FinishGlow or not FinishGlow.Parent then
-            warn("Tower reset before finish! Restarting script...")
-            if whitelister then whitelister:Destroy() end
-            return
-        end
-        
-        local old = RootPart.Position
-        Tween(RootPart, FinishGlow.Position - Vector3.new(0, 2, 0), nil, false)
-        Tween(RootPart, old, nil, false)
-        print("Finished")
-        
-        -- Clean up whitelister
-        if whitelister then
-            whitelister:Destroy()
-            print("Whitelister removed")
-        end
-        
-        -- Reset character immediately
-        print("Resetting character...")
-        local humanoid = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildWhichIsA("Humanoid")
-        if humanoid then
-            humanoid.Health = 0
-            humanoid:ChangeState(Enum.HumanoidStateType.Dead)
-        else
-            LocalPlayer.Character:BreakJoints()
-        end
-        
-        -- Wait 4 seconds
-        print("Waiting 4 seconds before teleport...")
-        task.wait(4)
-        
-        -- Teleport to Pro Mode
-        print("Teleporting to Pro Mode (PlaceId: 3582763398)...")
-        local TeleportService = game:GetService("TeleportService")
-        local success2, err = pcall(function()
-            TeleportService:Teleport(3582763398, LocalPlayer)
-        end)
-        
-        if not success2 then
-            warn("Teleport failed: " .. tostring(err))
-        end
+            safeWait(0.5)
+         end
+    end
+    
+    print("[ToH] Reached top. Resetting character for next run...")
+    
+    -- Reset character
+    if Humanoid then
+        Humanoid.Health = 0
+    end
+    
+    -- Wait for death/respawn processing
+    safeWait(4)
+    
+    -- Teleport logic (Pro Mode or Rejoin)
+    print("[ToH] Teleporting to Pro Mode (3582763398)...")
+    local success, err = pcall(function()
+        TeleportService:Teleport(3582763398, LocalPlayer)
     end)
     
     if not success then
-        warn("Error occurred: " .. tostring(error))
-        -- Clean up any leftover whitelister
-        local oldWhitelister = workspace:FindFirstChild("Whitelister")
-        if oldWhitelister then 
-            oldWhitelister:Destroy()
-            print("Cleaned up whitelister")
-        end
-        print("Restarting script in 2 seconds...")
+        warn("[ToH] Teleport failed: " .. tostring(err))
+        -- Retry logic or just wait
+        safeWait(5)
     end
 end
+
+
+-- Execute
+task.spawn(function()
+    while true do
+        safeWait(1)
+        if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+             -- Simple check: Are we at the bottom?
+             if LocalPlayer.Character.HumanoidRootPart.Position.Y < 50 then -- Assuming spawn is low
+                 RunScript()
+                 
+                 -- Wait before next run (e.g. after teleport or reset)
+                 safeWait(10) 
+             end
+        end
+    end
+end)
