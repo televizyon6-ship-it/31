@@ -1,288 +1,432 @@
--- Prevent double execution (autoexec + queue_on_teleport)
+--------------------------------------------------------------------------------
+-- Tower of Hell | Auto-Complete Script (Rewritten)
+-- Anti-Float: Jump arc simulation, ground-verification raycasting, no raw CFrame tween
+--------------------------------------------------------------------------------
+
+-- Prevent double execution
 if getgenv().TOH_LOADED then return end
 pcall(function() getgenv().TOH_LOADED = true end)
 
-local TweenService = game:GetService("TweenService")
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
+local TweenService    = game:GetService("TweenService")
+local Players         = game:GetService("Players")
+local RunService      = game:GetService("RunService")
 local TeleportService = game:GetService("TeleportService")
-local VirtualUser = game:GetService("VirtualUser")
+local VirtualUser     = game:GetService("VirtualUser")
 
-local LocalPlayer = Players.LocalPlayer
-local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-local Humanoid = Character:WaitForChild("Humanoid")
-local RootPart = Character:WaitForChild("HumanoidRootPart")
+local LP = Players.LocalPlayer
+local Char, Hum, Root
 
--- Update Character references on respawn
-LocalPlayer.CharacterAdded:Connect(function(char)
-    Character = char
-    Humanoid = char:WaitForChild("Humanoid")
-    RootPart = char:WaitForChild("HumanoidRootPart")
-end)
+local function refreshChar(char)
+    Char = char or LP.Character
+    Hum  = Char and Char:WaitForChild("Humanoid")
+    Root = Char and Char:WaitForChild("HumanoidRootPart")
+end
 
--- Auto-execute on teleport logic (Preserved)
-local SCRIPT_URL = "https://raw.githubusercontent.com/televizyon6-ship-it/31/refs/heads/main/ww"
-local queueteleport = queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
-if type(queueteleport) == "function" then
-    pcall(queueteleport, 'loadstring(game:HttpGet("' .. SCRIPT_URL .. '"))()')
-    print("[ToH] Script queued for next server!")
+refreshChar(LP.Character or LP.CharacterAdded:Wait())
+LP.CharacterAdded:Connect(refreshChar)
+
+--------------------------------------------------------------------------------
+-- Auto-queue on teleport
+--------------------------------------------------------------------------------
+local SCRIPT_URL   = "https://raw.githubusercontent.com/televizyon6-ship-it/31/refs/heads/main/ww"
+local queueTeleport = queue_on_teleport or queueonteleport
+    or (syn and syn.queue_on_teleport)
+    or (fluxus and fluxus.queue_on_teleport)
+
+if type(queueTeleport) == "function" then
+    pcall(queueTeleport, ('loadstring(game:HttpGet("%s"))()'):format(SCRIPT_URL))
+    print("[ToH] Queued for next server.")
 end
 
 -- Anti-AFK
-LocalPlayer.Idled:Connect(function()
+LP.Idled:Connect(function()
     VirtualUser:CaptureController()
     VirtualUser:ClickButton2(Vector2.new())
 end)
 
 --------------------------------------------------------------------------------
--- Configuration
+-- Config
 --------------------------------------------------------------------------------
-local Config = {
-    TweenSpeed = 5, -- Studs per second (slower is safer)
-    UseRandomPath = true, -- Randomly visit parts instead of direct line
-    LandOnParts = true, -- Stop tween to simulate landing (anti-float)
-    MaxJumpDistance = 45, -- Max distance to tween between parts
-    VerticalScanRange = 100, -- Vertical distance to look for next part
+local CFG = {
+    -- Movement
+    TweenSpeed        = 28,      -- Stud/s for tweens (horizontal speed)
+    ArcHeight         = 6,       -- Peak height of simulated jump arc
+    ArcSteps          = 20,      -- Keyframes per arc (more = smoother, heavier)
+    StepDelay         = 0.02,    -- Seconds between arc keyframes
+
+    -- Safety
+    MaxHopDist        = 60,      -- Max stud gap to bridge in one hop
+    MinHopDist        = 3,       -- Ignore parts closer than this
+    FloatLeniency     = 0.3,     -- Extra seconds to "land" before next move
+    GroundSnapOffset  = 4.2,     -- How far above a part's surface to hover (char height)
+
+    -- Kill-part detection
+    KillNames         = {"kill", "lava", "acid", "spike", "death", "drown"},
+    KillNeon          = true,    -- Treat neon red/orange as kill parts
+
+    -- Misc
+    RunLoopDelay      = 1,       -- Seconds between run-loop ticks
+    PostRunWait       = 10,      -- Wait after completing/resetting before next cycle
+    SpawnMaxY         = 60,      -- Y threshold to consider "at spawn / bottom"
 }
 
 --------------------------------------------------------------------------------
--- Helper Functions
+-- Utility
 --------------------------------------------------------------------------------
-
--- Custom "Wait" compatible with task scheduler
-local function safeWait(t)
-    local start = tick()
-    repeat RunService.Heartbeat:Wait() until tick() - start >= (t or 0)
+local function wait(t)
+    local s = tick()
+    repeat RunService.Heartbeat:Wait() until tick() - s >= (t or 0)
 end
 
--- Check if a part is safe to land on
-local function isSafePart(part)
+local function randomOffset(range)
+    return Vector3.new(
+        math.random(-range*10, range*10)/10,
+        0,
+        math.random(-range*10, range*10)/10
+    )
+end
+
+-- Raycast downward from pos, returns hit position or nil
+local RaycastParams_down = RaycastParams.new()
+RaycastParams_down.FilterType = Enum.RaycastFilterType.Exclude
+
+local function groundBelow(pos, charParts)
+    RaycastParams_down.FilterDescendantsInstances = charParts or {}
+    local result = workspace:Raycast(pos, Vector3.new(0, -200, 0), RaycastParams_down)
+    if result then return result.Position end
+    return nil
+end
+
+-- Is a part dangerous?
+local function isKillPart(part)
+    if not part:IsA("BasePart") then return false end
+    local name = part.Name:lower()
+    for _, kw in ipairs(CFG.KillNames) do
+        if name:find(kw) then return true end
+    end
+    if CFG.KillNeon and part.Material == Enum.Material.Neon then
+        local r, g, b = part.Color.R, part.Color.G, part.Color.B
+        if r > 0.85 and g < 0.25 then return true end -- red/orange neon
+    end
+    return false
+end
+
+-- Is it safe to stand on?
+local function isSafe(part)
     if not part:IsA("BasePart") then return false end
     if not part.CanCollide then return false end
-    if part.Transparency >= 1 then return false end
-    if part.Name:lower() == "kills" or part.Name:lower():find("kill") then return false end
-    -- Check for neon red (often kill parts) - simple heuristic
-    if part.Material == Enum.Material.Neon and part.Color.R > 0.9 and part.Color.G < 0.1 then return false end
+    if part.Transparency >= 0.9 then return false end
+    if isKillPart(part) then return false end
     return true
 end
 
--- Get all safe parts in a section, sorted by height
-local function getSafePartsInSection(section)
-    local parts = {}
-    for _, child in ipairs(section:GetDescendants()) do
-        if isSafePart(child) then
-            table.insert(parts, child)
+--------------------------------------------------------------------------------
+-- Core Movement: Simulated Jump Arc (anti-float)
+-- Instead of a direct tween through air, we compute a parabolic arc so the
+-- player accelerates up then down — matching how real jumps look to the server.
+--------------------------------------------------------------------------------
+local function killForces()
+    if not Root then return end
+    for _, v in ipairs(Root:GetChildren()) do
+        if v:IsA("BodyMover") then v:Destroy() end
+    end
+end
+
+-- Briefly pin character so it stops drifting between moves
+local function pinRoot()
+    if not Root then return end
+    killForces()
+    local bv = Instance.new("BodyVelocity")
+    bv.Velocity  = Vector3.zero
+    bv.MaxForce  = Vector3.new(1e5, 1e5, 1e5)
+    bv.Parent    = Root
+    return bv
+end
+
+-- Move via arc keyframes between two world positions
+-- targetPos should be the destination *surface* (we handle the Y offset internally)
+local function arcMove(targetPos, heightBoost)
+    if not Root then return end
+    
+    local height = heightBoost or CFG.ArcHeight
+    local steps  = CFG.ArcSteps
+    local delay  = CFG.StepDelay
+
+    local startPos = Root.Position
+    local endPos   = targetPos
+
+    -- Calculate horizontal distance to decide arc height scaling
+    local hDist = (Vector3.new(endPos.X, 0, endPos.Z) - Vector3.new(startPos.X, 0, startPos.Z)).Magnitude
+    -- Short hops don't need a big arc
+    local arcScale = math.clamp(hDist / 20, 0.4, 1.0)
+    local arcH     = height * arcScale
+
+    killForces()
+
+    local bp = Instance.new("BodyPosition")
+    bp.MaxForce  = Vector3.new(1e5, 1e5, 1e5)
+    bp.D         = 500
+    bp.P         = 5000
+    bp.Parent    = Root
+
+    local bg = Instance.new("BodyGyro")
+    bg.MaxTorque = Vector3.new(1e5, 1e5, 1e5)
+    bg.D         = 400
+    bg.CFrame    = CFrame.new(startPos, endPos) -- face direction of travel
+    bg.Parent    = Root
+
+    for i = 1, steps do
+        local t = i / steps
+        -- Lerp X/Z linearly, Y follows a sine arc (0 → peak → 0 extra height)
+        local lerpPos = startPos:Lerp(endPos, t)
+        local yArc    = arcH * math.sin(math.pi * t)
+
+        bp.Position = Vector3.new(lerpPos.X, lerpPos.Y + yArc, lerpPos.Z)
+        wait(delay)
+
+        -- Bail early if we died
+        if not Hum or Hum.Health <= 0 then
+            killForces()
+            return
         end
     end
-    -- Sort by Y level (ascending)
-    table.sort(parts, function(a, b)
-        return a.Position.Y < b.Position.Y
-    end)
+
+    -- Snap to exact destination
+    bp.Position = endPos
+
+    -- Wait for physics to settle us on the surface
+    wait(CFG.FloatLeniency)
+    killForces()
+
+    -- Zero residual velocity
+    local bv = pinRoot()
+    wait(0.08)
+    if bv and bv.Parent then bv:Destroy() end
+end
+
+-- Shorter/same-level move without a big arc (walking equivalent)
+local function slideMove(targetPos)
+    arcMove(targetPos, 1.5) -- tiny arc just to avoid floating in place
+end
+
+--------------------------------------------------------------------------------
+-- Part Collection & Sorting
+--------------------------------------------------------------------------------
+local function getCharParts()
+    local t = {}
+    if Char then for _, v in ipairs(Char:GetDescendants()) do if v:IsA("BasePart") then t[#t+1] = v end end end
+    return t
+end
+
+local function getSafeParts(container)
+    local parts = {}
+    for _, d in ipairs(container:GetDescendants()) do
+        if isSafe(d) then parts[#parts+1] = d end
+    end
+    table.sort(parts, function(a, b) return a.Position.Y < b.Position.Y end)
     return parts
 end
 
--- Tween function with callbacks and anti-cheat measures
-local function Tween(targetCFrame, speedOverride)
-    if not RootPart then return end
-    
-    local distance = (RootPart.Position - targetCFrame.Position).Magnitude
-    local speed = speedOverride or Config.TweenSpeed
-    local time = distance / speed
-    
-    -- Easing Style: Sine for smoother start/stop
-    local tweenInfo = TweenInfo.new(
-        time,
-        Enum.EasingStyle.Sine,
-        Enum.EasingDirection.InOut
-    )
-    
-    local goal = {CFrame = targetCFrame}
-    
-    -- 1. Disable Physics (temporarily anchor) to prevent weird fling
-    -- RootPart.Anchored = true 
-    -- Actually, forcing velocity to 0 is better for "float" checks sometimes?
-    -- But anchoring is safer for exact positioning.
-    -- Let's stick to BodyVelocity or just standard Tween which ignores physics if anchored.
-    -- Better: Set velocity to 0 constantly.
-    
-    local bv = Instance.new("BodyVelocity")
-    bv.Velocity = Vector3.zero
-    bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
-    bv.Parent = RootPart
-    
-    local tween = TweenService:Create(RootPart, tweenInfo, goal)
-    tween:Play()
-    
-    -- Wait for tween to complete
-    tween.Completed:Wait()
-    
-    -- Cleanup
-    if bv then bv:Destroy() end
-    
-    -- Anti-Float / Landing Logic
-    if Config.LandOnParts then
-        -- We are at the target. 
-        -- Stop everything.
-        -- Wait a split second to register "standing".
-        -- Since we tweened to (Part + 3 studs), we might be in air.
-        -- Drop down?
-        -- For safety, we just wait a tiny bit.
-        safeWait(0.1)
-    end
-end
+-- Given a sorted list of parts, produce a minimal hop chain from startY to endY
+-- Skips parts that are too close, merges when gap is fine
+local function buildHopChain(parts, fromY, toY)
+    local chain = {}
+    local lastPos = Root.Position
 
---------------------------------------------------------------------------------
--- Main Logic
---------------------------------------------------------------------------------
-local function RunScript()
-    local Tower = workspace:WaitForChild("tower", 10)
-    if not Tower then warn("Tower not found!") return end
-    
-    local Sections = Tower:WaitForChild("sections", 10)
-    if not Sections then warn("Sections not found!") return end
+    for _, p in ipairs(parts) do
+        local py = p.Position.Y + CFG.GroundSnapOffset
+        if py <= fromY then continue end
+        if py > toY + CFG.GroundSnapOffset + 10 then break end
 
-    print("[ToH] Starting run...")
-    
-    -- Disable collision for player character to avoid getting stuck
-    for _, v in pairs(Character:GetChildren()) do
-        if v:IsA("BasePart") then v.CanCollide = false end
-    end
-    
-    -- Get Sorted Sections
-    local sectionList = {}
-    for _, section in pairs(Sections:GetChildren()) do
-        local startPart = section:FindFirstChild("start")
-        local stopPart = section:FindFirstChild("stop")
-        -- Fallback: Use bounding box center if start/stop missing
-        local yPos = 0
-        if startPart then yPos = startPart.Position.Y 
-        elseif stopPart then yPos = stopPart.Position.Y 
+        local dist = (p.Position - lastPos).Magnitude
+        if dist < CFG.MinHopDist then continue end
+
+        -- If gap is too big, we must include this node as a bridge
+        -- If gap is normal, include it anyway (looks natural, avoids float)
+        if dist <= CFG.MaxHopDist then
+            local landPos = Vector3.new(p.Position.X, p.Position.Y + CFG.GroundSnapOffset, p.Position.Z)
+                + randomOffset(0.4) -- tiny random offset per node, looks human
+            chain[#chain+1] = landPos
+            lastPos = p.Position
         else
-            -- Check average of children?
-            local parts = getSafePartsInSection(section)
-            if #parts > 0 then yPos = parts[1].Position.Y end
-        end
-        
-        table.insert(sectionList, {
-            Instance = section,
-            Y = yPos,
-            Start = startPart,
-            Stop = stopPart
-        })
-    end
-    
-    table.sort(sectionList, function(a, b) return a.Y < b.Y end)
-    
-    -- Traverse Sections
-    for i, sectionData in ipairs(sectionList) do
-        print("[ToH] Entering Section " .. sectionData.Instance.Name)
-        
-        local parts = getSafePartsInSection(sectionData.Instance)
-        
-        -- Strategy:
-        -- 1. Go to Start (if exists)
-        -- 2. "Hop" through safe parts up to Stop
-        -- 3. Go to Stop (if exists)
-        
-        if sectionData.Start then
-            Tween(sectionData.Start.CFrame + Vector3.new(0, 3.5, 0))
-        end
-        
-        -- Pathfinding through parts
-        local currentY = RootPart.Position.Y
-        local targetY = sectionData.Stop and sectionData.Stop.Position.Y or (parts[#parts] and parts[#parts].Position.Y or currentY + 50)
-        
-        -- If we have parts, use them to climb
-        if #parts > 0 then
-            -- Initial filter: Only parts *above* us
-            local pathNodes = {}
-            for _, p in ipairs(parts) do
-                if p.Position.Y > currentY and p.Position.Y <= targetY then
-                     table.insert(pathNodes, p)
-                end
-            end
-            
-            -- Visit a subset of these nodes to look natural
-            -- We don't need to visit EVERY part, just enough to not fly 200 studs at once
-            local lastNodePos = RootPart.Position
-            for _, node in ipairs(pathNodes) do
-                local dist = (node.Position - lastNodePos).Magnitude
-                -- Only move if it's a significant jump but not HUGE. 
-                -- Or if it bridges the gap.
-                -- Heuristic: If distance > 10 and distance < MaxJumpDistance
-                if dist > 5 and dist < Config.MaxJumpDistance then
-                    -- 50% chance to skip if we can just jump to next one?
-                    -- Actually, visiting more is safer against anti-float.
-                    Tween(node.CFrame + Vector3.new(0, 3.5, 0))
-                    lastNodePos = node.Position
-                elseif dist >= Config.MaxJumpDistance then
-                    -- If gap is too big, we MUST visit this node to bridge it
-                    Tween(node.CFrame + Vector3.new(0, 3.5, 0))
-                    lastNodePos = node.Position
-                end
-            end
-        end
-        
-        if sectionData.Stop then
-            Tween(sectionData.Stop.CFrame + Vector3.new(0, 3.5, 0))
+            -- Gap too large: try to find intermediate nodes already in chain or skip
+            -- (If truly no bridge exists, we do a long arc anyway)
+            local landPos = Vector3.new(p.Position.X, p.Position.Y + CFG.GroundSnapOffset, p.Position.Z)
+            chain[#chain+1] = landPos
+            lastPos = p.Position
         end
     end
-    
-    -- Finish handling
-    local Finish = Sections:FindFirstChild("finish") 
-        or Sections.Parent:FindFirstChild("finish") -- checking tower root too
-    
-    if Finish then
-         local finishGlow = Finish:FindFirstChild("FinishGlow")
-         if finishGlow then
-            print("[ToH] Touching FinishGlow...")
-            -- Tween to finish and touch it
-            Tween(finishGlow.CFrame)
-            -- Simulate touch just in case
-            if firetouchinterest then
-                firetouchinterest(RootPart, finishGlow, 0)
-                firetouchinterest(RootPart, finishGlow, 1)
-            end
-            safeWait(0.5)
-         end
-    end
-    
-    print("[ToH] Reached top. Resetting character for next run...")
-    
-    -- Reset character
-    if Humanoid then
-        Humanoid.Health = 0
-    end
-    
-    -- Wait for death/respawn processing
-    safeWait(4)
-    
-    -- Teleport logic (Pro Mode or Rejoin)
-    print("[ToH] Teleporting to Pro Mode (3582763398)...")
-    local success, err = pcall(function()
-        TeleportService:Teleport(3582763398, LocalPlayer)
-    end)
-    
-    if not success then
-        warn("[ToH] Teleport failed: " .. tostring(err))
-        -- Retry logic or just wait
-        safeWait(5)
+
+    return chain
+end
+
+--------------------------------------------------------------------------------
+-- Disable Character Collision (so we don't snag on geometry)
+--------------------------------------------------------------------------------
+local function setCharCollision(enabled)
+    if not Char then return end
+    for _, v in ipairs(Char:GetDescendants()) do
+        if v:IsA("BasePart") then
+            v.CanCollide = enabled
+        end
     end
 end
 
+--------------------------------------------------------------------------------
+-- Main Run Logic
+--------------------------------------------------------------------------------
+local function runTower()
+    local Tower    = workspace:FindFirstChild("tower")
+    local Sections = Tower and Tower:FindFirstChild("sections")
 
--- Execute
+    if not Tower or not Sections then
+        warn("[ToH] Could not find tower/sections in workspace.")
+        return
+    end
+
+    print("[ToH] Tower found. Starting run...")
+    setCharCollision(false)
+
+    -- Build sorted section list
+    local sectionList = {}
+    for _, sec in ipairs(Sections:GetChildren()) do
+        local startP = sec:FindFirstChild("start")
+        local stopP  = sec:FindFirstChild("stop")
+        local yRef   = 0
+        if startP then
+            yRef = startP.Position.Y
+        elseif stopP then
+            yRef = stopP.Position.Y
+        else
+            local parts = getSafeParts(sec)
+            if #parts > 0 then yRef = parts[1].Position.Y end
+        end
+        sectionList[#sectionList+1] = {
+            instance = sec,
+            y        = yRef,
+            startP   = startP,
+            stopP    = stopP,
+        }
+    end
+
+    table.sort(sectionList, function(a, b) return a.y < b.y end)
+
+    -- Traverse each section
+    for i, sd in ipairs(sectionList) do
+        if not Root or (Hum and Hum.Health <= 0) then break end
+
+        print(("[ToH] Section %d/%d — %s"):format(i, #sectionList, sd.instance.Name))
+
+        -- 1. Travel to section start
+        if sd.startP then
+            local dest = sd.startP.Position + Vector3.new(0, CFG.GroundSnapOffset, 0)
+            local dist = (Root.Position - dest).Magnitude
+            if dist > CFG.MinHopDist then
+                if dist <= 15 then slideMove(dest) else arcMove(dest) end
+            end
+        end
+
+        -- 2. Hop through safe parts upward
+        local fromY = Root.Position.Y
+        local toY   = sd.stopP and sd.stopP.Position.Y
+                    or (getSafeParts(sd.instance)[1] and select(2,({pcall(function()
+                            local p = getSafeParts(sd.instance)
+                            return p[#p] and p[#p].Position.Y or fromY + 200
+                        end)})) or fromY + 200)
+
+        -- Safer: just use stopP or a big Y window
+        toY = sd.stopP and (sd.stopP.Position.Y + 5) or (fromY + 300)
+
+        local parts = getSafeParts(sd.instance)
+        local chain = buildHopChain(parts, fromY - 5, toY)
+
+        for _, nodePos in ipairs(chain) do
+            if not Root or (Hum and Hum.Health <= 0) then break end
+            local dist = (Root.Position - nodePos).Magnitude
+            if dist < CFG.MinHopDist then continue end
+
+            if dist <= 18 then
+                slideMove(nodePos)
+            else
+                arcMove(nodePos)
+            end
+        end
+
+        -- 3. Travel to section stop
+        if sd.stopP then
+            local dest = sd.stopP.Position + Vector3.new(0, CFG.GroundSnapOffset, 0)
+            local dist = (Root.Position - dest).Magnitude
+            if dist > CFG.MinHopDist then
+                if dist <= 15 then slideMove(dest) else arcMove(dest) end
+            end
+        end
+    end
+
+    -- Check for a finish part anywhere in tower
+    local function findFinish(root)
+        return root:FindFirstChild("finish", true)
+            or root:FindFirstChild("FinishLine", true)
+            or root:FindFirstChild("End", true)
+    end
+
+    local finishContainer = findFinish(Sections) or findFinish(Tower)
+    if finishContainer then
+        print("[ToH] Approaching finish...")
+        local finishPos = finishContainer:IsA("BasePart")
+            and finishContainer.Position
+            or (finishContainer:FindFirstChildWhichIsA("BasePart") and
+                finishContainer:FindFirstChildWhichIsA("BasePart").Position)
+
+        if finishPos then
+            arcMove(finishPos + Vector3.new(0, CFG.GroundSnapOffset, 0))
+        end
+
+        -- Fire touch events for any Touched-based finish triggers
+        if firetouchinterest and finishContainer:IsA("BasePart") then
+            firetouchinterest(Root, finishContainer, 0)
+            wait(0.1)
+            firetouchinterest(Root, finishContainer, 1)
+        end
+    end
+
+    print("[ToH] Run complete! Resetting...")
+    wait(1.5)
+
+    -- Re-enable collision before reset so respawn is clean
+    setCharCollision(true)
+    if Hum then Hum.Health = 0 end
+
+    wait(CFG.PostRunWait)
+
+    -- Teleport to Pro Mode lobby
+    print("[ToH] Teleporting to Pro Mode...")
+    local ok, err = pcall(TeleportService.Teleport, TeleportService, 3582763398, LP)
+    if not ok then warn("[ToH] Teleport failed: " .. tostring(err)) end
+end
+
+--------------------------------------------------------------------------------
+-- Run Loop
+--------------------------------------------------------------------------------
 task.spawn(function()
     while true do
-        safeWait(1)
-        if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
-             -- Simple check: Are we at the bottom?
-             if LocalPlayer.Character.HumanoidRootPart.Position.Y < 50 then -- Assuming spawn is low
-                 RunScript()
-                 
-                 -- Wait before next run (e.g. after teleport or reset)
-                 safeWait(10) 
-             end
+        wait(CFG.RunLoopDelay)
+
+        refreshChar()
+        if not Root then continue end
+
+        local atSpawn = Root.Position.Y < CFG.SpawnMaxY
+        if atSpawn then
+            -- Small delay so the server has a moment to init
+            wait(2)
+            local ok, err = pcall(runTower)
+            if not ok then
+                warn("[ToH] Run error: " .. tostring(err))
+                setCharCollision(true) -- safety restore
+                killForces()
+            end
+            wait(CFG.PostRunWait)
         end
     end
 end)
+
+print("[ToH] Script loaded.")
