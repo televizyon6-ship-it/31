@@ -38,7 +38,7 @@ end)
 -- Configuration
 --------------------------------------------------------------------------------
 local Config = {
-    TweenSpeed = 35, -- Studs per second (slower is safer)
+    TweenSpeed = 5, -- Studs per second (slower is safer)
     UseRandomPath = true, -- Randomly visit parts instead of direct line
     LandOnParts = true, -- Stop tween to simulate landing (anti-float)
     MaxJumpDistance = 45, -- Max distance to tween between parts
