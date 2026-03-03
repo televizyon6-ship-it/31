@@ -1,3 +1,1 @@
-local hi = "h"
-
-print (hi)
+enabled = false
